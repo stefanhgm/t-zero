@@ -23,6 +23,7 @@ https://github.com/huggingface/transformers/blob/master/examples/pytorch/summari
 """
 
 import argparse
+import datetime
 import logging
 import os
 import random
@@ -34,7 +35,7 @@ import math
 
 import datasets
 import torch
-from datasets import load_dataset, load_metric
+from datasets import load_dataset, load_metric, load_from_disk, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -53,8 +54,7 @@ from transformers import (
     set_seed,
 )
 from transformers.file_utils import PaddingStrategy
-from promptsource.templates import DatasetTemplates
-
+from promptsource.templates import DatasetTemplates, Template
 
 logger = logging.getLogger(__name__)
 
@@ -373,8 +373,13 @@ def main():
             raw_train_dataset = load_dataset(args.dataset_name, split=f'train_{args.dataset_config_name}')  # dataset_config_name = "r1", "r2", or "r3"
             raw_eval_dataset = load_dataset(args.dataset_name, split=f'dev_{args.dataset_config_name}')
         else:
-            raw_train_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="train")
-            raw_eval_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="validation")
+            try:
+                raw_train_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="train")
+                raw_eval_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="validation")
+            except ValueError as e:
+                raw_dataset_dict = DatasetDict.load_from_disk(args.dataset_name)
+                raw_train_dataset = raw_dataset_dict["train"]
+                raw_eval_dataset = raw_dataset_dict["valid"]
     else:
         raise ValueError('Please specify `args.dataset_name` and `args.dataset_config_name` as appear in `promptsource`.')
     #TODO(Victor): enable loading pre-processed dataset from https://huggingface.co/datasets/bigscience/P3
@@ -385,7 +390,6 @@ def main():
         raw_eval_dataset = raw_eval_dataset.select(range(min(100, len(raw_eval_dataset))))
 
     column_names = raw_eval_dataset.column_names
-
 
     # Load pretrained model and tokenizer
     #
@@ -434,6 +438,17 @@ def main():
             if args.dataset_config_name is None
             else f"{args.dataset_name}/{args.dataset_config_name}"
         )
+
+    # Define a unique model checkpoint name
+    cp_name = f"{args.dataset_name}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    cp_path = '/localdata/stefanhg/cp/' + cp_name
+    os.mkdir(cp_path)
+
+    # Add custom template
+    tm = Template.Metadata(original_task=True, choices_in_prompt=True, metrics=['AUC'])
+    t = Template('no_yes', "{{note}}\n|||\n{{ answer_choices[label] }}", '', metadata=tm, answer_choices="No ||| Yes")
+    prompts.add_template(t)
+
     template = prompts[args.template_name]
 
     def preprocess_train(examples):
@@ -613,6 +628,7 @@ def main():
             model, optimizer, train_dataloader, eval_dataloader)
 
     # Metrics
+    metric_auc = load_metric("roc_auc")
     metric = load_metric("accuracy")
 
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -646,6 +662,7 @@ def main():
         )
 
     result_table = []
+    best_score_auc = -1.
     for epoch in range(1, args.num_train_epochs+1):
         model.train()
         for step, batch in enumerate(train_dataloader):
@@ -690,16 +707,28 @@ def main():
             seq_log_prob = seq_token_log_probs.squeeze(dim=-1).sum(dim=-1)
             seq_log_prob = seq_log_prob.view(batch["targets"].size(0), -1) #TODO(Victor): this reshapes works based on the assumption that all examples have the same number of choices. the pre-processing doesn't make this assumption.
             predictions = seq_log_prob.argmax(dim=-1)
+            prediction_scores = torch.exp(seq_log_prob[:, 1])
 
             metric.add_batch(
                 predictions=accelerator.gather(predictions),
+                references=accelerator.gather(batch["targets"]),
+            )
+            metric_auc.add_batch(
+                prediction_scores=accelerator.gather(prediction_scores),
                 references=accelerator.gather(batch["targets"]),
             )
 
             # progress_bar.update(1)
 
         eval_metric = metric.compute()
+        eval_metric_auc = metric_auc.compute()
         score = eval_metric["accuracy"]  # TODO support other metrics; currently hardcoded at load_metric() anyway
+        score_auc = eval_metric_auc["roc_auc"]
+        if score_auc > best_score_auc:
+            cp_file = cp_path + '/pytorch_model-' + str(epoch) + '.bin'
+            torch.save(model.state_dict(), cp_file)
+            best_score_auc = score_auc
+        accelerator.print(f"AUC: {score_auc}")
         accelerator.print(f"Accuracy: {score}")
         result_table.append({
             "dataset_name": args.dataset_name,
