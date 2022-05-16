@@ -29,13 +29,15 @@ import os
 import random
 from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 from typing import Optional, Union
 import csv
 import math
 
 import datasets
 import torch
-from datasets import load_dataset, load_metric, load_from_disk, DatasetDict
+import yaml
+from datasets import load_dataset, load_metric, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -376,8 +378,9 @@ def main():
             try:
                 raw_train_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="train")
                 raw_eval_dataset = load_dataset(args.dataset_name, args.dataset_config_name, split="validation")
-            except ValueError as e:
-                raw_dataset_dict = DatasetDict.load_from_disk(args.dataset_name)
+            except Exception as e:
+                dataset_path = Path('/data/IBC/stefan_ibc/omop-pkg/datasets')
+                raw_dataset_dict = DatasetDict.load_from_disk(dataset_path / args.dataset_name)
                 raw_train_dataset = raw_dataset_dict["train"]
                 raw_eval_dataset = raw_dataset_dict["valid"]
     else:
@@ -445,11 +448,13 @@ def main():
     os.mkdir(cp_path)
 
     # Add custom template
-    tm = Template.Metadata(original_task=True, choices_in_prompt=True, metrics=['AUC'])
-    t = Template('no_yes', "{{note}}\n|||\n{{ answer_choices[label] }}", '', metadata=tm, answer_choices="No ||| Yes")
-    prompts.add_template(t)
+    task = args.dataset_name.split('_')[0]
+    yaml_dict = yaml.load(open('/data/IBC/stefan_ibc/omop-pkg/templates/templates_' + task + '.yaml', "r"), Loader=yaml.FullLoader)
 
-    template = prompts[args.template_name]
+    prompts = yaml_dict['templates']
+    # Array access not working, so look manually for matching template
+    # template = prompts[args.template_name]
+    template = [t for k, t in prompts.items() if t.get_name() == args.template_name][0]
 
     def preprocess_train(examples):
         bs = len(examples[column_names[0]])
@@ -501,6 +506,8 @@ def main():
                 for k in column_names
             }
             input, target = template.apply(ex)
+            # Debug inputs
+            # print(input, '--->', target)
             ex_answer_choices = template.get_answer_choices_list(ex)
             assert target in ex_answer_choices
             input_texts.append(input)
