@@ -383,6 +383,7 @@ def main():
                 raw_dataset_dict = DatasetDict.load_from_disk(dataset_path / args.dataset_name)
                 raw_train_dataset = raw_dataset_dict["train"]
                 raw_eval_dataset = raw_dataset_dict["valid"]
+                raw_test_dataset = raw_dataset_dict["test"]
     else:
         raise ValueError('Please specify `args.dataset_name` and `args.dataset_config_name` as appear in `promptsource`.')
     #TODO(Victor): enable loading pre-processed dataset from https://huggingface.co/datasets/bigscience/P3
@@ -391,6 +392,7 @@ def main():
     if args.debug:
         raw_train_dataset = raw_train_dataset.select(range(min(100, len(raw_train_dataset))))
         raw_eval_dataset = raw_eval_dataset.select(range(min(100, len(raw_eval_dataset))))
+        raw_test_dataset = raw_test_dataset.select(range(min(100, len(raw_test_dataset))))
 
     column_names = raw_eval_dataset.column_names
 
@@ -556,6 +558,7 @@ def main():
 
     with accelerator.main_process_first():
         eval_dataset = raw_eval_dataset.map(preprocess_eval, batched=True, remove_columns=column_names)
+        test_dataset = raw_test_dataset.map(preprocess_eval, batched=True, remove_columns=column_names)
 
         if args.num_shots is not None:
             sample_indices = random.sample(range(0, len(raw_train_dataset)), k=args.num_shots)
@@ -594,6 +597,7 @@ def main():
             tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
         )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=eval_collator, batch_size=args.per_device_eval_batch_size)
+    test_dataloader = DataLoader(test_dataset, collate_fn=eval_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -628,15 +632,17 @@ def main():
         num_gpus = torch.cuda.device_count()
         assert num_gpus > 1, "You need at least 2 GPUs to use `model.parallelize()`."
         model.parallelize()
-        optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-            optimizer, train_dataloader, eval_dataloader)
+        optimizer, train_dataloader, eval_dataloader, test_dataloader = accelerator.prepare(
+            optimizer, train_dataloader, eval_dataloader, test_dataloader)
     else:
-        model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader)
+        model, optimizer, train_dataloader, eval_dataloader, test_dataloader = accelerator.prepare(
+            model, optimizer, train_dataloader, eval_dataloader, test_dataloader)
 
     # Metrics
     metric_auc = load_metric("roc_auc")
     metric = load_metric("accuracy")
+    metric_auc_test = load_metric("roc_auc")
+    metric_test = load_metric("accuracy")
 
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -732,11 +738,42 @@ def main():
         score = eval_metric["accuracy"]  # TODO support other metrics; currently hardcoded at load_metric() anyway
         score_auc = eval_metric_auc["roc_auc"]
         if score_auc > best_score_auc:
-            cp_file = cp_path + '/pytorch_model-' + str(epoch) + '.bin'
+            cp_file = cp_path + '/pytorch_model.bin'
             torch.save(model.state_dict(), cp_file)
             best_score_auc = score_auc
-        accelerator.print(f"AUC: {score_auc}")
-        accelerator.print(f"Accuracy: {score}")
+
+        # un evaluation on test set for debugging to check if results agree with manual test evaluation
+        for batch in test_dataloader:
+            model_inputs = {
+                k: batch[k]
+                for k in ["input_ids", "attention_mask", "labels"]
+            }
+            with torch.no_grad():
+                logits = model(**model_inputs).logits
+            masked_log_probs = batch["labels_attention_mask"].unsqueeze(-1) * torch.log_softmax(logits, dim=-1)
+            seq_token_log_probs = torch.gather(masked_log_probs, -1, batch["labels"].unsqueeze(-1))
+            seq_log_prob = seq_token_log_probs.squeeze(dim=-1).sum(dim=-1)
+            seq_log_prob = seq_log_prob.view(batch["targets"].size(0), -1) #TODO(Victor): this reshapes works based on the assumption that all examples have the same number of choices. the pre-processing doesn't make this assumption.
+            predictions = seq_log_prob.argmax(dim=-1)
+            prediction_scores = torch.exp(seq_log_prob[:, 1])
+
+            metric_test.add_batch(
+                predictions=accelerator.gather(predictions),
+                references=accelerator.gather(batch["targets"]),
+            )
+            metric_auc_test.add_batch(
+                prediction_scores=accelerator.gather(prediction_scores),
+                references=accelerator.gather(batch["targets"]),
+            )
+
+            # progress_bar.update(1)
+
+        test_metric = metric_test.compute()
+        test_metric_auc = metric_auc_test.compute()
+        test_score = test_metric["accuracy"]  # TODO support other metrics; currently hardcoded at load_metric() anyway
+        test_score_auc = test_metric_auc["roc_auc"]
+        accelerator.print(f"AUC: {score_auc}, Accuracy: {score} (Test AUC: {test_score_auc} Accuracy: {test_score})")
+
         result_table.append({
             "dataset_name": args.dataset_name,
             "dataset_config_name": args.dataset_config_name,
@@ -745,14 +782,26 @@ def main():
             "step": global_steps,
             "metric": 'accuracy',
             "score": score,
+            "metric_auc": 'roc_auc',
+            "score_auc": score_auc,
+            "test metric": 'test_accuracy',
+            "test score": test_score,
+            "test metric_auc": 'test_roc_auc',
+            "test score_auc": test_score_auc,
         })
         if args.wandb_proj and accelerator.is_main_process:
-            wandb.log({"accuracy": score}, step=global_steps)
+            wandb.log({"auc": score_auc, "accuracy": score}, step=global_steps)
     # End training loop
 
     if accelerator.is_main_process:
         if args.output_dir is not None:
             with open(os.path.join(args.output_dir, "results.csv"), "w") as f:
+                writer = csv.DictWriter(f, fieldnames=result_table[0].keys())
+                writer.writeheader()
+                writer.writerows(result_table)
+
+        if cp_path is not None:
+            with open(os.path.join(cp_path, "results.csv"), "w") as f:
                 writer = csv.DictWriter(f, fieldnames=result_table[0].keys())
                 writer.writeheader()
                 writer.writerows(result_table)
